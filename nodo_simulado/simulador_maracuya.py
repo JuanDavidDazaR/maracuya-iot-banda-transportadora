@@ -1,16 +1,53 @@
-
 import json
 import time
 import random
 import argparse
 from datetime import datetime, timezone
 
-# Peso simulado por fruta buena depositada en la caja (gramos)
+
 PESO_MIN_FRUTA, PESO_MAX_FRUTA = 80.0, 130.0
 
-# Tiempo simulado entre el paso de dos frutas consecutivas por el sensor
-# de conteo de entrada (segundos)
 INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA = 0.3, 1.2
+
+
+PROVEEDORES = {
+    "1": ("PROV-001", "Roldanillo"),
+    "2": ("PROV-002", "La Unión"),
+    "3": ("PROV-003", "El Dovio"),
+    "4": ("PROV-004", "Toro"),
+}
+
+
+def elegir_proveedor() -> str:
+    """
+    Muestra el menú de proveedores (1 a 4) y pide al usuario que elija
+    uno antes de iniciar la simulación. Devuelve el idProveedor elegido.
+    """
+    print("Selecciona el proveedor de la fruta para esta simulación:")
+    for numero, (id_prov, nombre) in PROVEEDORES.items():
+        print(f"  {numero}. {nombre} ({id_prov})")
+
+    while True:
+        opcion = input("Proveedor [1-4]: ").strip()
+        if opcion in PROVEEDORES:
+            id_prov, nombre = PROVEEDORES[opcion]
+            print(f"Proveedor seleccionado: {nombre} ({id_prov})\n")
+            return id_prov
+        print("Opción inválida. Ingresa un número entre 1 y 4.")
+
+
+def esperar_comando_start() -> None:
+    """
+    Bloquea la ejecución hasta que el usuario escriba 'start' y presione
+    Enter, para dar tiempo a revisar la configuración antes de que
+    empiecen a enviarse los mensajes JSON.
+    """
+    while True:
+        comando = input("Escribe 'start' y presiona Enter para iniciar la simulación: ").strip().lower()
+        if comando == "start":
+            print()
+            return
+        print("Comando no reconocido. Escribe 'start' para comenzar.")
 
 
 class EstadisticasLinea:
@@ -172,7 +209,7 @@ def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: st
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Simula el nodo sensor de la banda transportadora de "
+            "Simula el nodo sensor (ESP32) de la banda transportadora de "
             "maracuyá y publica un registro JSON cada vez que se completa una caja, "
             "además de alertas si una caja tarda demasiado en llenarse."
         )
@@ -198,10 +235,10 @@ def main():
         )
     )
     parser.add_argument(
-        "--promedio-inicial-min", type=float, default=2.0,
+        "--promedio-inicial-min", type=float, default=0.5,
         help=(
             "Promedio de llenado de caja asumido ANTES de tener historial real, "
-            "en minutos (por defecto: 2.0). Una vez se completan cajas reales, el "
+            "en minutos (por defecto: 5). Una vez se completan cajas reales, el "
             "promedio se recalcula solo."
         )
     )
@@ -250,16 +287,27 @@ def main():
         help="Identificador de la banda transportadora (por defecto: cali.banda01)."
     )
     parser.add_argument(
-        "--id-proveedor", default="PROV-001",
-        help="Identificador del proveedor/lote de fruta (por defecto: PROV-001)."
+        "--id-proveedor", default=None,
+        help=(
+            "Identificador del proveedor (PROV-001 a PROV-004). Si se omite, "
+            "la simulación pregunta interactivamente al iniciar (menú 1-4)."
+        )
     )
     args = parser.parse_args()
+
+    # Selección del proveedor: si se pasó por línea de comandos se usa
+    # directamente (útil para pruebas automáticas); si no, se pregunta.
+    id_proveedor = args.id_proveedor if args.id_proveedor else elegir_proveedor()
+
+    # Espera a que el usuario escriba "start" antes de comenzar a enviar
+    # los mensajes JSON de la simulación.
+    esperar_comando_start()
 
     estadisticas = EstadisticasLinea(promedio_inicial_seg=args.promedio_inicial_min * 60)
 
     print(
         f"Nodo {args.id_banda}: simulando banda transportadora, "
-        f"proveedor = {args.id_proveedor}, "
+        f"proveedor = {id_proveedor}, "
         f"peso objetivo por caja = {args.peso_objetivo} kg, "
         f"prob. fruta buena = {args.prob_buena}, "
         f"promedio inicial = {args.promedio_inicial_min} min, "
@@ -275,7 +323,7 @@ def main():
             ultimo_mensaje = None
             for mensaje in generar_caja(
                 id_caja, args.peso_objetivo, args.prob_buena,
-                args.id_banda, args.id_proveedor,
+                args.id_banda, id_proveedor,
                 estadisticas, args.factor_alerta,
             ):
                 # Un objeto JSON por línea, publicado en el momento en que ocurre
@@ -286,7 +334,7 @@ def main():
             # que el operario la cambie; mientras tanto puede haber alertas.
             if ultimo_mensaje and ultimo_mensaje.get("estadoCaja") == "Completa":
                 for evento in simular_cambio_caja(
-                    id_caja, args.id_banda, args.id_proveedor,
+                    id_caja, args.id_banda, id_proveedor,
                     args.tiempo_cambio_min_seg, args.tiempo_cambio_max_seg,
                     args.prob_operario_lento,
                     args.tiempo_cambio_lento_min_seg, args.tiempo_cambio_lento_max_seg,
