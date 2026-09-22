@@ -3,12 +3,16 @@ import time
 import random
 import argparse
 from datetime import datetime, timezone
+import paho.mqtt.client as mqtt
 
+# Configuración MQTT requerida
+BROKER = "broker.emqx.io"
+PORT = 1883
+TOPIC = "maracuya/banda/data"
+CLIENT_ID = "cali-banda01"
 
 PESO_MIN_FRUTA, PESO_MAX_FRUTA = 80.0, 130.0
-
 INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA = 0.3, 1.2
-
 
 PROVEEDORES = {
     "1": ("PROV-001", "Roldanillo"),
@@ -77,21 +81,8 @@ class EstadisticasLinea:
 
 
 def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
-                  id_banda: str, id_proveedor: str,
-                  estadisticas: EstadisticasLinea, factor_alerta: float):
-    """
-    Simula el llenado de una caja fruto a fruto hasta alcanzar el peso
-    objetivo. Es un generador que cede como máximo dos mensajes:
-
-      1. (Opcional, una sola vez) "alertaCajaNoLlenada": si pasa el
-         tiempo esperado sin completarse la caja (ej. porque llega
-         fruta muy dañada y el rechazo automático descarta casi todo).
-         El conteo sigue en segundo plano después de esta alerta; no
-         se repite.
-      2. "cajaCompletada": el registro final, cuando la caja alcanza el
-         peso objetivo. Este es el único mensaje del camino normal
-         (sin problemas).
-    """
+                 id_banda: str, id_proveedor: str,
+                 estadisticas: EstadisticasLinea, factor_alerta: float):
     peso_objetivo_g = peso_objetivo_kg * 1000
     frutas_procesadas = 0
     frutas_buenas = 0
@@ -102,22 +93,17 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
     alerta_enviada = False
 
     while peso_acumulado_g < peso_objetivo_g:
-        # Sensor de conteo de entrada: pasa una nueva fruta por la banda
         time.sleep(random.uniform(INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA))
         frutas_procesadas += 1
 
-        # Sensor de color: clasifica la fruta
         es_buena = random.random() < prob_fruta_buena
 
         if es_buena:
-            # Sensor de conteo de fruta buena + celda de carga
             frutas_buenas += 1
             peso_acumulado_g += random.uniform(PESO_MIN_FRUTA, PESO_MAX_FRUTA)
         else:
-            # Actuador expulsor retira la fruta antes del empaque
             frutas_rechazadas += 1
 
-        # Umbral dinámico: factor_alerta veces el promedio de llenado actual
         promedio_seg = estadisticas.promedio_actual_seg
         umbral_seg = promedio_seg * factor_alerta
         tiempo_transcurrido = time.monotonic() - tiempo_inicio
@@ -141,12 +127,6 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
             }
             alerta_enviada = True
 
-    # El tiempo de llenado se mide internamente con el reloj del ESP32
-    # (time.monotonic() aquí simula millis()) para alimentar el promedio
-    # y la lógica de alertas, pero NO se envía en el JSON: la plataforma
-    # puede calcularlo restando marcas de tiempo entre mensajes. El
-    # porcentaje de rechazo tampoco se envía: se calcula en la plataforma
-    # como frutasRechazadas / frutasProcesadas.
     tiempo_total_seg = time.monotonic() - tiempo_inicio
     estadisticas.registrar_tiempo(tiempo_total_seg)
 
@@ -164,18 +144,10 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
 
 
 def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: str,
-                         tiempo_min_seg: float, tiempo_max_seg: float,
-                         prob_operario_lento: float,
-                         tiempo_lento_min_seg: float, tiempo_lento_max_seg: float,
-                         umbral_alerta_seg: float):
-    """
-    Simula el tiempo que tarda el operario en retirar la caja llena y
-    reanudar la banda transportadora. Si el cambio se hace dentro del
-    tiempo esperado (camino normal), esta función no emite NADA. Solo
-    si se supera "umbral_alerta_seg" sin que se haya cambiado la caja,
-    cede UNA sola vez "alertaCajaNoCambiada" (no se repite).
-    """
-    # Con cierta probabilidad, el operario se demora mucho en atender la línea
+                        tiempo_min_seg: float, tiempo_max_seg: float,
+                        prob_operario_lento: float,
+                        tiempo_lento_min_seg: float, tiempo_lento_max_seg: float,
+                        umbral_alerta_seg: float):
     if random.random() < prob_operario_lento:
         tiempo_espera_seg = random.uniform(tiempo_lento_min_seg, tiempo_lento_max_seg)
     else:
@@ -206,102 +178,60 @@ def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: st
             alerta_enviada = True
 
 
+def enviar_por_mqtt(client: mqtt.Client, payload: dict) -> None:
+    """Convierte el diccionario a JSON y lo publica en el tópico MQTT especificado."""
+    json_data = json.dumps(payload, ensure_ascii=False)
+    client.publish(TOPIC, json_data, qos=1)
+    # Mostramos en consola lo que se acaba de enviar
+    print(f"[MQTT -> {TOPIC}] {json_data}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Simula el nodo sensor (ESP32) de la banda transportadora de "
-            "maracuyá y publica un registro JSON cada vez que se completa una caja, "
-            "además de alertas si una caja tarda demasiado en llenarse."
+            "maracuyá y publica un registro JSON en el broker MQTT cada vez "
+            "que se completa una caja o se genera una alerta."
         )
     )
-    parser.add_argument(
-        "-p", "--peso-objetivo", type=float, default=10.0,
-        help="Peso objetivo de la caja en kg (por defecto: 10.0)."
-    )
-    parser.add_argument(
-        "-c", "--caja-inicial", type=int, default=1,
-        help="Número de caja con el que inicia el conteo (por defecto: 1)."
-    )
-    parser.add_argument(
-        "-n", "--num-cajas", type=int, default=None,
-        help="Número de cajas a simular. Si no se indica, simula indefinidamente."
-    )
-    parser.add_argument(
-        "-b", "--prob-buena", type=float, default=0.85,
-        help=(
-            "Probabilidad (0 a 1) de que una fruta sea clasificada como buena. "
-            "Bájala (ej. 0.1) para simular fruta muy dañada y forzar que la caja "
-            "se estanque y se disparen alertas (por defecto: 0.85)."
-        )
-    )
-    parser.add_argument(
-        "--promedio-inicial-min", type=float, default=0.5,
-        help=(
-            "Promedio de llenado de caja asumido ANTES de tener historial real, "
-            "en minutos (por defecto: 5). Una vez se completan cajas reales, el "
-            "promedio se recalcula solo."
-        )
-    )
-    parser.add_argument(
-        "--factor-alerta", type=float, default=2.0,
-        help=(
-            "Múltiplo del promedio de llenado a partir del cual se considera que "
-            "una caja está estancada y se envía la alerta (por defecto: 2.0, ej. "
-            "si el promedio es 5 min, alerta a los 10 min)."
-        )
-    )
-    parser.add_argument(
-        "--tiempo-cambio-min-seg", type=float, default=2.0,
-        help="Tiempo mínimo (seg) que tarda el operario en cambiar la caja llena en condiciones normales (por defecto: 2.0)."
-    )
-    parser.add_argument(
-        "--tiempo-cambio-max-seg", type=float, default=6.0,
-        help="Tiempo máximo (seg) que tarda el operario en cambiar la caja llena en condiciones normales (por defecto: 6.0)."
-    )
-    parser.add_argument(
-        "--prob-operario-lento", type=float, default=0.15,
-        help=(
-            "Probabilidad (0 a 1) de que el operario se demore mucho en cambiar "
-            "la caja (distraído, atendiendo otra tarea), simulando que la banda "
-            "queda detenida sin acción (por defecto: 0.15)."
-        )
-    )
-    parser.add_argument(
-        "--tiempo-cambio-lento-min-seg", type=float, default=30.0,
-        help="Tiempo mínimo (seg) de demora del operario en el caso 'lento' (por defecto: 30.0)."
-    )
-    parser.add_argument(
-        "--tiempo-cambio-lento-max-seg", type=float, default=90.0,
-        help="Tiempo máximo (seg) de demora del operario en el caso 'lento' (por defecto: 90.0)."
-    )
-    parser.add_argument(
-        "--umbral-banda-detenida-seg", type=float, default=15.0,
-        help=(
-            "Segundos que la banda puede estar detenida sin acción del operario "
-            "antes de enviar (y repetir) la alerta 'alertaBandaDetenida' al "
-            "dashboard del supervisor (por defecto: 15.0)."
-        )
-    )
-    parser.add_argument(
-        "--id-banda", default="cali-banda01",
-        help="Identificador de la banda transportadora (por defecto: cali.banda01)."
-    )
-    parser.add_argument(
-        "--id-proveedor", default=None,
-        help=(
-            "Identificador del proveedor (PROV-001 a PROV-004). Si se omite, "
-            "la simulación pregunta interactivamente al iniciar (menú 1-4)."
-        )
-    )
+    parser.add_argument("-p", "--peso-objetivo", type=float, default=10.0)
+    parser.add_argument("-c", "--caja-inicial", type=int, default=1)
+    parser.add_argument("-n", "--num-cajas", type=int, default=None)
+    parser.add_argument("-b", "--prob-buena", type=float, default=0.85)
+    parser.add_argument("--promedio-inicial-min", type=float, default=0.5)
+    parser.add_argument("--factor-alerta", type=float, default=2.0)
+    parser.add_argument("--tiempo-cambio-min-seg", type=float, default=2.0)
+    parser.add_argument("--tiempo-cambio-max-seg", type=float, default=6.0)
+    parser.add_argument("--prob-operario-lento", type=float, default=0.15)
+    parser.add_argument("--tiempo-cambio-lento-min-seg", type=float, default=30.0)
+    parser.add_argument("--tiempo-cambio-lento-max-seg", type=float, default=90.0)
+    parser.add_argument("--umbral-banda-detenida-seg", type=float, default=15.0)
+    parser.add_argument("--id-banda", default="cali-banda01")
+    parser.add_argument("--id-proveedor", default=None)
     args = parser.parse_args()
 
-    # Selección del proveedor: si se pasó por línea de comandos se usa
-    # directamente (útil para pruebas automáticas); si no, se pregunta.
     id_proveedor = args.id_proveedor if args.id_proveedor else elegir_proveedor()
-
-    # Espera a que el usuario escriba "start" antes de comenzar a enviar
-    # los mensajes JSON de la simulación.
     esperar_comando_start()
+
+    # --- Configuración y Conexión al Broker MQTT ---
+    # Se utiliza CallbackAPIVersion.VERSION2 si usas paho-mqtt >= 2.0
+    try:
+        client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2, 
+            client_id=CLIENT_ID
+        )
+    except AttributeError:
+        # Compatibilidad con versiones antiguas de paho-mqtt (< 2.0)
+        client = mqtt.Client(client_id=CLIENT_ID)
+
+    print(f"Conectando al broker MQTT {BROKER}:{PORT} con Client ID: '{CLIENT_ID}'...")
+    try:
+        client.connect(BROKER, PORT, keepalive=60)
+        client.loop_start()  # Inicia hilo en segundo plano para gestionar reconexiones
+        print("Conectado exitosamente al broker MQTT.\n")
+    except Exception as e:
+        print(f"Error al conectar con el broker MQTT: {e}")
+        return
 
     estadisticas = EstadisticasLinea(promedio_inicial_seg=args.promedio_inicial_min * 60)
 
@@ -309,9 +239,7 @@ def main():
         f"Nodo {args.id_banda}: simulando banda transportadora, "
         f"proveedor = {id_proveedor}, "
         f"peso objetivo por caja = {args.peso_objetivo} kg, "
-        f"prob. fruta buena = {args.prob_buena}, "
-        f"promedio inicial = {args.promedio_inicial_min} min, "
-        f"factor de alerta = {args.factor_alerta}x. "
+        f"prob. fruta buena = {args.prob_buena}. "
         f"Presiona Ctrl+C para detener.\n"
     )
 
@@ -326,12 +254,10 @@ def main():
                 args.id_banda, id_proveedor,
                 estadisticas, args.factor_alerta,
             ):
-                # Un objeto JSON por línea, publicado en el momento en que ocurre
-                print(json.dumps(mensaje, ensure_ascii=False))
+                # Publicar evento/alerta vía MQTT
+                enviar_por_mqtt(client, mensaje)
                 ultimo_mensaje = mensaje
 
-            # Si la caja se completó, la banda se detiene (motor apagado) hasta
-            # que el operario la cambie; mientras tanto puede haber alertas.
             if ultimo_mensaje and ultimo_mensaje.get("estadoCaja") == "Completa":
                 for evento in simular_cambio_caja(
                     id_caja, args.id_banda, id_proveedor,
@@ -340,12 +266,17 @@ def main():
                     args.tiempo_cambio_lento_min_seg, args.tiempo_cambio_lento_max_seg,
                     args.umbral_banda_detenida_seg,
                 ):
-                    print(json.dumps(evento, ensure_ascii=False))
+                    # Publicar alerta de banda detenida vía MQTT
+                    enviar_por_mqtt(client, evento)
 
             id_caja += 1
             cajas_generadas += 1
     except KeyboardInterrupt:
-        print("\nSimulación detenida.")
+        print("\nSimulación detenida por el usuario.")
+    finally:
+        client.loop_stop()
+        client.disconnect()
+        print("Conexión MQTT cerrada.")
 
 
 if __name__ == "__main__":
