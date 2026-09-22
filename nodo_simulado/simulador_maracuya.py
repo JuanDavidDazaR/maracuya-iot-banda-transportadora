@@ -10,8 +10,8 @@ import paho.mqtt.client as mqtt
 BROKER = "broker.emqx.io"
 PORT = 1883
 TOPIC_PUB = "maracuya/banda/data"
-TOPIC_SUB = "maracuya/banda/cali-banda01/command"
-CLIENT_ID = "cali-banda01"
+TOPIC_SUB = "maracuya/banda/cali-banda01/command" # cambia cali-banda01 por el ID_BANDA correspondiente
+CLIENT_ID = "cali-banda01" # cambia cali-banda01 por el ID_BANDA correspondiente
 
 PESO_MIN_FRUTA, PESO_MAX_FRUTA = 80.0, 130.0
 INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA = 0.3, 1.2
@@ -200,7 +200,7 @@ def main():
     parser.add_argument("--tiempo-cambio-lento-min-seg", type=float, default=30.0)
     parser.add_argument("--tiempo-cambio-lento-max-seg", type=float, default=90.0)
     parser.add_argument("--umbral-banda-detenida-seg", type=float, default=15.0)
-    parser.add_argument("--id-banda", default="cali-banda01")
+    parser.add_argument("--id-banda", default="cali-banda01") # cambia cali-banda01 por el ID_BANDA correspondiente
     parser.add_argument("--id-proveedor", default="PROV-001")
     args = parser.parse_args()
 
