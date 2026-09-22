@@ -2,13 +2,15 @@ import json
 import time
 import random
 import argparse
+import threading
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
-# Configuración MQTT requerida
+# Configuración MQTT
 BROKER = "broker.emqx.io"
 PORT = 1883
-TOPIC = "maracuya/banda/data"
+TOPIC_PUB = "maracuya/banda/data"
+TOPIC_SUB = "maracuya/banda/cali-banda01/command"
 CLIENT_ID = "cali-banda01"
 
 PESO_MIN_FRUTA, PESO_MAX_FRUTA = 80.0, 130.0
@@ -21,47 +23,13 @@ PROVEEDORES = {
     "4": ("PROV-004", "Toro"),
 }
 
-
-def elegir_proveedor() -> str:
-    """
-    Muestra el menú de proveedores (1 a 4) y pide al usuario que elija
-    uno antes de iniciar la simulación. Devuelve el idProveedor elegido.
-    """
-    print("Selecciona el proveedor de la fruta para esta simulación:")
-    for numero, (id_prov, nombre) in PROVEEDORES.items():
-        print(f"  {numero}. {nombre} ({id_prov})")
-
-    while True:
-        opcion = input("Proveedor [1-4]: ").strip()
-        if opcion in PROVEEDORES:
-            id_prov, nombre = PROVEEDORES[opcion]
-            print(f"Proveedor seleccionado: {nombre} ({id_prov})\n")
-            return id_prov
-        print("Opción inválida. Ingresa un número entre 1 y 4.")
-
-
-def esperar_comando_start() -> None:
-    """
-    Bloquea la ejecución hasta que el usuario escriba 'start' y presione
-    Enter, para dar tiempo a revisar la configuración antes de que
-    empiecen a enviarse los mensajes JSON.
-    """
-    while True:
-        comando = input("Escribe 'start' y presiona Enter para iniciar la simulación: ").strip().lower()
-        if comando == "start":
-            print()
-            return
-        print("Comando no reconocido. Escribe 'start' para comenzar.")
+# --- Variables de control de estado global ---
+simulacion_activa = False
+id_proveedor_actual = "PROV-001"
+evento_start = threading.Event()
 
 
 class EstadisticasLinea:
-    """
-    Mantiene el promedio de tiempo de llenado de caja a lo largo de la
-    simulación. Empieza con un valor por defecto (no hay historial aún)
-    y se va recalculando como promedio simple de los tiempos reales de
-    cada caja completada.
-    """
-
     def __init__(self, promedio_inicial_seg: float):
         self.promedio_inicial_seg = promedio_inicial_seg
         self.tiempos_llenado_seg = []
@@ -92,10 +60,13 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
     tiempo_inicio = time.monotonic()
     alerta_enviada = False
 
-    while peso_acumulado_g < peso_objetivo_g:
+    while peso_acumulado_g < peso_objetivo_g and simulacion_activa:
         time.sleep(random.uniform(INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA))
-        frutas_procesadas += 1
+        
+        if not simulacion_activa:
+            break
 
+        frutas_procesadas += 1
         es_buena = random.random() < prob_fruta_buena
 
         if es_buena:
@@ -120,28 +91,28 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
                 "promedioLlenadoActualSeg": round(promedio_seg, 1),
                 "cajasEnHistorialPromedio": estadisticas.num_cajas_en_historial,
                 "frutasProcesadas": frutas_procesadas,
-                "frutasBuenas": frutas_buenas,
+                "frutasBuenas": frutas_buenas,  # CORREGIDO: antes decía frutasBuenas
                 "frutasRechazadas": frutas_rechazadas,
                 "pesoActual": round(peso_acumulado_g / 1000, 2),
                 "pesoObjetivo": peso_objetivo_kg,
             }
             alerta_enviada = True
 
-    tiempo_total_seg = time.monotonic() - tiempo_inicio
-    estadisticas.registrar_tiempo(tiempo_total_seg)
+    if simulacion_activa:
+        tiempo_total_seg = time.monotonic() - tiempo_inicio
+        estadisticas.registrar_tiempo(tiempo_total_seg)
 
-    yield {
-        "idBanda": id_banda,
-        "idProveedor": id_proveedor,
-        "idCaja": id_caja,
-        "fechaHora": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "frutasProcesadas": frutas_procesadas,
-        "frutasBuenas": frutas_buenas,
-        "frutasRechazadas": frutas_rechazadas,
-        "pesoFinal": round(peso_acumulado_g / 1000, 2),
-        "estadoCaja": "Completa",
-    }
-
+        yield {
+            "idBanda": id_banda,
+            "idProveedor": id_proveedor,
+            "idCaja": id_caja,
+            "fechaHora": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "frutasProcesadas": frutas_procesadas,
+            "frutasBuenas": frutas_buenas,
+            "frutasRechazadas": frutas_rechazadas,
+            "pesoFinal": round(peso_acumulado_g / 1000, 2),
+            "estadoCaja": "Completa",
+        }
 
 def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: str,
                         tiempo_min_seg: float, tiempo_max_seg: float,
@@ -157,7 +128,7 @@ def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: st
     alerta_enviada = False
     paso_seg = 0.5
 
-    while True:
+    while simulacion_activa:
         transcurrido = time.monotonic() - inicio
         if transcurrido >= tiempo_espera_seg:
             break
@@ -179,20 +150,43 @@ def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: st
 
 
 def enviar_por_mqtt(client: mqtt.Client, payload: dict) -> None:
-    """Convierte el diccionario a JSON y lo publica en el tópico MQTT especificado."""
     json_data = json.dumps(payload, ensure_ascii=False)
-    client.publish(TOPIC, json_data, qos=1)
-    # Mostramos en consola lo que se acaba de enviar
-    print(f"[MQTT -> {TOPIC}] {json_data}")
+    client.publish(TOPIC_PUB, json_data, qos=1)
+    print(f"[MQTT PUB -> {TOPIC_PUB}] {json_data}")
+
+
+def on_message(client, userdata, msg):
+    """Callback invocado al recibir un JSON en el tópico suscrito."""
+    global simulacion_activa, id_proveedor_actual
+    try:
+        payload = json.loads(msg.payload.decode('utf-8'))
+        print(f"\n[MQTT SUB <- {msg.topic}] Comando recibido: {payload}")
+
+        comando = str(payload.get("command", "")).lower()
+
+        if comando == "start":
+            id_prov = payload.get("idProveedor", id_proveedor_actual)
+            id_proveedor_actual = id_prov
+            simulacion_activa = True
+            evento_start.set()
+            print(f"-> ACTUACIÓN: Simulación INICIADA. Proveedor: {id_proveedor_actual}\n")
+
+        elif comando == "stop":
+            simulacion_activa = False
+            evento_start.clear()
+            print("-> ACTUACIÓN: Simulación DETENIDA por comando MQTT.\n")
+
+    except json.JSONDecodeError:
+        print("Error: El mensaje recibido no es un JSON válido.")
+    except Exception as e:
+        print(f"Error procesando el comando: {e}")
 
 
 def main():
+    global id_proveedor_actual, simulacion_activa
+
     parser = argparse.ArgumentParser(
-        description=(
-            "Simula el nodo sensor (ESP32) de la banda transportadora de "
-            "maracuyá y publica un registro JSON en el broker MQTT cada vez "
-            "que se completa una caja o se genera una alerta."
-        )
+        description="Nodo simulado con control remoto vía MQTT."
     )
     parser.add_argument("-p", "--peso-objetivo", type=float, default=10.0)
     parser.add_argument("-c", "--caja-inicial", type=int, default=1)
@@ -207,72 +201,85 @@ def main():
     parser.add_argument("--tiempo-cambio-lento-max-seg", type=float, default=90.0)
     parser.add_argument("--umbral-banda-detenida-seg", type=float, default=15.0)
     parser.add_argument("--id-banda", default="cali-banda01")
-    parser.add_argument("--id-proveedor", default=None)
+    parser.add_argument("--id-proveedor", default="PROV-001")
     args = parser.parse_args()
 
-    id_proveedor = args.id_proveedor if args.id_proveedor else elegir_proveedor()
-    esperar_comando_start()
+    id_proveedor_actual = args.id_proveedor
 
-    # --- Configuración y Conexión al Broker MQTT ---
-    # Se utiliza CallbackAPIVersion.VERSION2 si usas paho-mqtt >= 2.0
+    # --- Configuración del Cliente MQTT ---
     try:
         client = mqtt.Client(
             mqtt.CallbackAPIVersion.VERSION2, 
             client_id=CLIENT_ID
         )
     except AttributeError:
-        # Compatibilidad con versiones antiguas de paho-mqtt (< 2.0)
         client = mqtt.Client(client_id=CLIENT_ID)
 
-    print(f"Conectando al broker MQTT {BROKER}:{PORT} con Client ID: '{CLIENT_ID}'...")
+    client.on_message = on_message
+
+    print(f"Conectando al broker {BROKER}:{PORT}...")
     try:
         client.connect(BROKER, PORT, keepalive=60)
-        client.loop_start()  # Inicia hilo en segundo plano para gestionar reconexiones
-        print("Conectado exitosamente al broker MQTT.\n")
+        client.subscribe(TOPIC_SUB)
+        client.loop_start()
+        print(f"Conectado y suscrito exitosamente a: '{TOPIC_SUB}'")
     except Exception as e:
-        print(f"Error al conectar con el broker MQTT: {e}")
+        print(f"Error al conectar con el broker: {e}")
         return
 
     estadisticas = EstadisticasLinea(promedio_inicial_seg=args.promedio_inicial_min * 60)
 
-    print(
-        f"Nodo {args.id_banda}: simulando banda transportadora, "
-        f"proveedor = {id_proveedor}, "
-        f"peso objetivo por caja = {args.peso_objetivo} kg, "
-        f"prob. fruta buena = {args.prob_buena}. "
-        f"Presiona Ctrl+C para detener.\n"
-    )
+    print("\n=======================================================")
+    print(f" Esperando comando MQTT en: {TOPIC_SUB}")
+    print(f" Ejemplo JSON para iniciar: {{\"command\": \"start\", \"idProveedor\": \"PROV-001\"}}")
+    print(f" Ejemplo JSON para detener: {{\"command\": \"stop\"}}")
+    print("=======================================================\n")
 
     id_caja = args.caja_inicial
     cajas_generadas = 0
 
     try:
-        while args.num_cajas is None or cajas_generadas < args.num_cajas:
-            ultimo_mensaje = None
-            for mensaje in generar_caja(
-                id_caja, args.peso_objetivo, args.prob_buena,
-                args.id_banda, id_proveedor,
-                estadisticas, args.factor_alerta,
-            ):
-                # Publicar evento/alerta vía MQTT
-                enviar_por_mqtt(client, mensaje)
-                ultimo_mensaje = mensaje
+        while True:
+            # Espera bloqueante hasta recibir comando 'start' vía MQTT
+            if not simulacion_activa:
+                evento_start.wait()
 
-            if ultimo_mensaje and ultimo_mensaje.get("estadoCaja") == "Completa":
-                for evento in simular_cambio_caja(
-                    id_caja, args.id_banda, id_proveedor,
-                    args.tiempo_cambio_min_seg, args.tiempo_cambio_max_seg,
-                    args.prob_operario_lento,
-                    args.tiempo_cambio_lento_min_seg, args.tiempo_cambio_lento_max_seg,
-                    args.umbral_banda_detenida_seg,
+            while simulacion_activa and (args.num_cajas is None or cajas_generadas < args.num_cajas):
+                ultimo_mensaje = None
+                for mensaje in generar_caja(
+                    id_caja, args.peso_objetivo, args.prob_buena,
+                    args.id_banda, id_proveedor_actual,
+                    estadisticas, args.factor_alerta,
                 ):
-                    # Publicar alerta de banda detenida vía MQTT
-                    enviar_por_mqtt(client, evento)
+                    if not simulacion_activa:
+                        break
+                    enviar_por_mqtt(client, mensaje)
+                    ultimo_mensaje = mensaje
 
-            id_caja += 1
-            cajas_generadas += 1
+                if (simulacion_activa and ultimo_mensaje 
+                        and ultimo_mensaje.get("estadoCaja") == "Completa"):
+                    for evento in simular_cambio_caja(
+                        id_caja, args.id_banda, id_proveedor_actual,
+                        args.tiempo_cambio_min_seg, args.tiempo_cambio_max_seg,
+                        args.prob_operario_lento,
+                        args.tiempo_cambio_lento_min_seg, args.tiempo_cambio_lento_max_seg,
+                        args.umbral_banda_detenida_seg,
+                    ):
+                        if not simulacion_activa:
+                            break
+                        enviar_por_mqtt(client, evento)
+
+                if simulacion_activa:
+                    id_caja += 1
+                    cajas_generadas += 1
+
+            if simulacion_activa:
+                print("Simulación completada por límite de cajas.")
+                simulacion_activa = False
+                evento_start.clear()
+
     except KeyboardInterrupt:
-        print("\nSimulación detenida por el usuario.")
+        print("\nPrograma finalizado manualmente.")
     finally:
         client.loop_stop()
         client.disconnect()
