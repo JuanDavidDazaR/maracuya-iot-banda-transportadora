@@ -6,12 +6,12 @@ import threading
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
 
-# Configuración MQTT
+# --- Configuración MQTT ---
 BROKER = "broker.emqx.io"
 PORT = 1883
 TOPIC_PUB = "maracuya/banda/data"
-TOPIC_SUB = "maracuya/banda/cali-banda01/command" # cambia cali-banda01 por el ID_BANDA correspondiente
-CLIENT_ID = "cali-banda01" # cambia cali-banda01 por el ID_BANDA correspondiente
+TOPIC_SUB = "maracuya/banda/cali-banda01/command"  # Rembosa'ita ID_BANDA rupive[cite: 1]
+CLIENT_ID = "cali-banda01"
 
 PESO_MIN_FRUTA, PESO_MAX_FRUTA = 80.0, 130.0
 INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA = 0.3, 1.2
@@ -26,6 +26,8 @@ PROVEEDORES = {
 # --- Variables de control de estado global ---
 simulacion_activa = False
 id_proveedor_actual = "PROV-001"
+peso_objetivo_actual = 10.0
+id_caja_actual = 1  # Guardamos la secuencia de la caja[cite: 1]
 evento_start = threading.Event()
 
 
@@ -58,7 +60,7 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
     peso_acumulado_g = 0.0
 
     tiempo_inicio = time.monotonic()
-    alerta_enviada = False
+    alertas_enviadas_caja = 0 
 
     while peso_acumulado_g < peso_objetivo_g and simulacion_activa:
         time.sleep(random.uniform(INTERVALO_MIN_FRUTA, INTERVALO_MAX_FRUTA))
@@ -79,24 +81,28 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
         umbral_seg = promedio_seg * factor_alerta
         tiempo_transcurrido = time.monotonic() - tiempo_inicio
 
-        if (not alerta_enviada and peso_acumulado_g < peso_objetivo_g
-                and tiempo_transcurrido >= umbral_seg):
+        # Alerta por cada umbral superado en la misma caja[cite: 1]
+        if (peso_acumulado_g < peso_objetivo_g and 
+                tiempo_transcurrido >= umbral_seg * (alertas_enviadas_caja + 1)):
+            
+            alertas_enviadas_caja += 1
+            
             yield {
                 "idBanda": id_banda,
                 "idProveedor": id_proveedor,
                 "idCaja": id_caja,
                 "fechaHora": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 "motivo": "tiempoExcedidoSinCompletar",
+                "numeroAlertaCaja": alertas_enviadas_caja,
                 "tiempoTranscurridoSeg": round(tiempo_transcurrido, 1),
                 "promedioLlenadoActualSeg": round(promedio_seg, 1),
                 "cajasEnHistorialPromedio": estadisticas.num_cajas_en_historial,
                 "frutasProcesadas": frutas_procesadas,
-                "frutasBuenas": frutas_buenas,  # CORREGIDO: antes decía frutasBuenas
+                "frutasBuenas": frutas_buenas,
                 "frutasRechazadas": frutas_rechazadas,
                 "pesoActual": round(peso_acumulado_g / 1000, 2),
                 "pesoObjetivo": peso_objetivo_kg,
             }
-            alerta_enviada = True
 
     if simulacion_activa:
         tiempo_total_seg = time.monotonic() - tiempo_inicio
@@ -113,6 +119,7 @@ def generar_caja(id_caja: int, peso_objetivo_kg: float, prob_fruta_buena: float,
             "pesoFinal": round(peso_acumulado_g / 1000, 2),
             "estadoCaja": "Completa",
         }
+
 
 def simular_cambio_caja(id_caja_completada: int, id_banda: str, id_proveedor: str,
                         tiempo_min_seg: float, tiempo_max_seg: float,
@@ -157,33 +164,54 @@ def enviar_por_mqtt(client: mqtt.Client, payload: dict) -> None:
 
 def on_message(client, userdata, msg):
     """Callback invocado al recibir un JSON en el tópico suscrito."""
-    global simulacion_activa, id_proveedor_actual
+    global simulacion_activa, id_proveedor_actual, peso_objetivo_actual, id_caja_actual
     try:
-        payload = json.loads(msg.payload.decode('utf-8'))
-        print(f"\n[MQTT SUB <- {msg.topic}] Comando recibido: {payload}")
+        payload_str = msg.payload.decode('utf-8').strip()
+        
+        # Ignorar payloads vacíos (usados para limpiar retained)
+        if not payload_str or payload_str == "{}":
+            return
 
+        payload = json.loads(payload_str)
         comando = str(payload.get("command", "")).lower()
 
+        if not comando:
+            return  # Ignorar JSONs que no contengan la propiedad "command"
+
+        print(f"\n[MQTT SUB <- {msg.topic}] Comando recibido: {payload}")
+
         if comando == "start":
-            id_prov = payload.get("idProveedor", id_proveedor_actual)
-            id_proveedor_actual = id_prov
+            nuevo_prov = payload.get("idProveedor", id_proveedor_actual)
+            
+            if nuevo_prov != id_proveedor_actual:
+                id_proveedor_actual = nuevo_prov
+                id_caja_actual = 1
+                print(f"-> CAMBIO DE PROVEEDOR: Lote nuevo ({id_proveedor_actual}). Caja reiniciada a 1.\n")
+            else:
+                print(f"-> REANUDACIÓN DE LOTE: Proveedor {id_proveedor_actual}. Continuando en Caja #{id_caja_actual}.\n")
+
+            if "cajaInicial" in payload and payload["cajaInicial"] is not None:
+                id_caja_actual = int(payload["cajaInicial"])
+
+            if "pesoObjetivo" in payload and payload["pesoObjetivo"] is not None:
+                peso_objetivo_actual = float(payload["pesoObjetivo"])
+
             simulacion_activa = True
             evento_start.set()
-            print(f"-> ACTUACIÓN: Simulación INICIADA. Proveedor: {id_proveedor_actual}\n")
 
         elif comando == "stop":
             simulacion_activa = False
             evento_start.clear()
-            print("-> ACTUACIÓN: Simulación DETENIDA por comando MQTT.\n")
+            print(f"-> ACTUACIÓN: Simulación DETENIDA por comando MQTT en Caja #{id_caja_actual}.\n")
 
     except json.JSONDecodeError:
-        print("Error: El mensaje recibido no es un JSON válido.")
+        pass # Ignorar mensajes no JSON sin lanzar error en consola
     except Exception as e:
         print(f"Error procesando el comando: {e}")
 
 
 def main():
-    global id_proveedor_actual, simulacion_activa
+    global id_proveedor_actual, simulacion_activa, peso_objetivo_actual, id_caja_actual
 
     parser = argparse.ArgumentParser(
         description="Nodo simulado con control remoto vía MQTT."
@@ -200,11 +228,13 @@ def main():
     parser.add_argument("--tiempo-cambio-lento-min-seg", type=float, default=30.0)
     parser.add_argument("--tiempo-cambio-lento-max-seg", type=float, default=90.0)
     parser.add_argument("--umbral-banda-detenida-seg", type=float, default=15.0)
-    parser.add_argument("--id-banda", default="cali-banda01") # cambia cali-banda01 por el ID_BANDA correspondiente
+    parser.add_argument("--id-banda", default="cali-banda01")
     parser.add_argument("--id-proveedor", default="PROV-001")
     args = parser.parse_args()
 
     id_proveedor_actual = args.id_proveedor
+    peso_objetivo_actual = args.peso_objetivo
+    id_caja_actual = args.caja_inicial
 
     # --- Configuración del Cliente MQTT ---
     try:
@@ -231,23 +261,22 @@ def main():
 
     print("\n=======================================================")
     print(f" Esperando comando MQTT en: {TOPIC_SUB}")
-    print(f" Ejemplo JSON para iniciar: {{\"command\": \"start\", \"idProveedor\": \"PROV-001\"}}")
+    print(f" Ejemplo JSON para iniciar: {{\"command\": \"start\", \"idProveedor\": \"PROV-001\", \"pesoObjetivo\": 10.0}}")
     print(f" Ejemplo JSON para detener: {{\"command\": \"stop\"}}")
     print("=======================================================\n")
 
-    id_caja = args.caja_inicial
     cajas_generadas = 0
 
     try:
         while True:
-            # Espera bloqueante hasta recibir comando 'start' vía MQTT
             if not simulacion_activa:
                 evento_start.wait()
 
             while simulacion_activa and (args.num_cajas is None or cajas_generadas < args.num_cajas):
                 ultimo_mensaje = None
+                
                 for mensaje in generar_caja(
-                    id_caja, args.peso_objetivo, args.prob_buena,
+                    id_caja_actual, peso_objetivo_actual, args.prob_buena,
                     args.id_banda, id_proveedor_actual,
                     estadisticas, args.factor_alerta,
                 ):
@@ -259,7 +288,7 @@ def main():
                 if (simulacion_activa and ultimo_mensaje 
                         and ultimo_mensaje.get("estadoCaja") == "Completa"):
                     for evento in simular_cambio_caja(
-                        id_caja, args.id_banda, id_proveedor_actual,
+                        id_caja_actual, args.id_banda, id_proveedor_actual,
                         args.tiempo_cambio_min_seg, args.tiempo_cambio_max_seg,
                         args.prob_operario_lento,
                         args.tiempo_cambio_lento_min_seg, args.tiempo_cambio_lento_max_seg,
@@ -270,7 +299,7 @@ def main():
                         enviar_por_mqtt(client, evento)
 
                 if simulacion_activa:
-                    id_caja += 1
+                    id_caja_actual += 1
                     cajas_generadas += 1
 
             if simulacion_activa:
